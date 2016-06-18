@@ -5,6 +5,7 @@
 
 #include "atom/browser/net/atom_url_request_job_factory.h"
 
+#include "base/memory/ptr_util.h"
 #include "base/stl_util.h"
 #include "content/public/browser/browser_thread.h"
 #include "net/base/load_flags.h"
@@ -24,9 +25,7 @@ AtomURLRequestJobFactory::~AtomURLRequestJobFactory() {
 
 bool AtomURLRequestJobFactory::SetProtocolHandler(
     const std::string& scheme,
-    ProtocolHandler* protocol_handler) {
-  DCHECK_CURRENTLY_ON(BrowserThread::IO);
-
+    std::unique_ptr<ProtocolHandler> protocol_handler) {
   if (!protocol_handler) {
     ProtocolHandlerMap::iterator it = protocol_handler_map_.find(scheme);
     if (it == protocol_handler_map_.end())
@@ -39,21 +38,28 @@ bool AtomURLRequestJobFactory::SetProtocolHandler(
 
   if (ContainsKey(protocol_handler_map_, scheme))
     return false;
-  protocol_handler_map_[scheme] = protocol_handler;
+  protocol_handler_map_[scheme] = protocol_handler.release();
   return true;
 }
 
-ProtocolHandler* AtomURLRequestJobFactory::ReplaceProtocol(
+bool AtomURLRequestJobFactory::InterceptProtocol(
     const std::string& scheme,
-    ProtocolHandler* protocol_handler) {
-  DCHECK_CURRENTLY_ON(BrowserThread::IO);
-  DCHECK(protocol_handler);
-
-  if (!ContainsKey(protocol_handler_map_, scheme))
-    return nullptr;
+    std::unique_ptr<ProtocolHandler> protocol_handler) {
+  if (!ContainsKey(protocol_handler_map_, scheme) ||
+      ContainsKey(original_protocols_, scheme))
+    return false;
   ProtocolHandler* original_protocol_handler = protocol_handler_map_[scheme];
-  protocol_handler_map_[scheme] = protocol_handler;
-  return original_protocol_handler;
+  protocol_handler_map_[scheme] = protocol_handler.release();
+  original_protocols_.set(scheme, base::WrapUnique(original_protocol_handler));
+  return true;
+}
+
+bool AtomURLRequestJobFactory::UninterceptProtocol(const std::string& scheme) {
+  if (!original_protocols_.contains(scheme))
+    return false;
+  protocol_handler_map_[scheme] =
+      original_protocols_.take_and_erase(scheme).release();
+  return true;
 }
 
 ProtocolHandler* AtomURLRequestJobFactory::GetProtocolHandler(

@@ -3,22 +3,51 @@
 // found in the LICENSE file.
 
 #include "atom/browser/api/atom_api_window.h"
+#include "atom/common/native_mate_converters/value_converter.h"
 
 #include "atom/browser/api/atom_api_menu.h"
 #include "atom/browser/api/atom_api_web_contents.h"
 #include "atom/browser/browser.h"
 #include "atom/browser/native_window.h"
+#include "atom/common/native_mate_converters/callback.h"
 #include "atom/common/native_mate_converters/gfx_converter.h"
 #include "atom/common/native_mate_converters/gurl_converter.h"
 #include "atom/common/native_mate_converters/image_converter.h"
 #include "atom/common/native_mate_converters/string16_converter.h"
+#include "atom/common/node_includes.h"
+#include "atom/common/options_switches.h"
 #include "content/public/browser/render_process_host.h"
-#include "native_mate/callback.h"
 #include "native_mate/constructor.h"
 #include "native_mate/dictionary.h"
 #include "ui/gfx/geometry/rect.h"
 
-#include "atom/common/node_includes.h"
+#if defined(TOOLKIT_VIEWS)
+#include "atom/browser/native_window_views.h"
+#endif
+
+#if defined(OS_WIN)
+#include "atom/browser/ui/win/taskbar_host.h"
+#endif
+
+#if defined(OS_WIN)
+namespace mate {
+
+template<>
+struct Converter<atom::TaskbarHost::ThumbarButton> {
+  static bool FromV8(v8::Isolate* isolate, v8::Handle<v8::Value> val,
+                     atom::TaskbarHost::ThumbarButton* out) {
+    mate::Dictionary dict;
+    if (!ConvertFromV8(isolate, val, &dict))
+      return false;
+    dict.Get("click", &(out->clicked_callback));
+    dict.Get("tooltip", &(out->tooltip));
+    dict.Get("flags", &out->flags);
+    return dict.Get("icon", &(out->icon));
+  }
+};
+
+}  // namespace mate
+#endif
 
 namespace atom {
 
@@ -35,15 +64,36 @@ void OnCapturePageDone(
   callback.Run(gfx::Image::CreateFrom1xBitmap(bitmap));
 }
 
+// Converts binary data to Buffer.
+v8::Local<v8::Value> ToBuffer(v8::Isolate* isolate, void* val, int size) {
+  auto buffer = node::Buffer::Copy(isolate, static_cast<char*>(val), size);
+  if (buffer.IsEmpty())
+    return v8::Null(isolate);
+  else
+    return buffer.ToLocalChecked();
+}
+
 }  // namespace
 
 
 Window::Window(v8::Isolate* isolate, const mate::Dictionary& options) {
+  // Use options.webPreferences to create WebContents.
+  mate::Dictionary web_preferences = mate::Dictionary::CreateEmpty(isolate);
+  options.Get(options::kWebPreferences, &web_preferences);
+
+  // Copy the backgroundColor to webContents.
+  v8::Local<v8::Value> value;
+  if (options.Get(options::kBackgroundColor, &value))
+    web_preferences.Set(options::kBackgroundColor, value);
+
   // Creates the WebContents used by BrowserWindow.
-  mate::Dictionary web_contents_options(isolate, v8::Object::New(isolate));
-  auto web_contents = WebContents::Create(isolate, web_contents_options);
+  auto web_contents = WebContents::Create(isolate, web_preferences);
   web_contents_.Reset(isolate, web_contents.ToV8());
   api_web_contents_ = web_contents.get();
+
+  // Keep a copy of the options for later use.
+  mate::Dictionary(isolate, web_contents->GetWrapper()).Set(
+      "browserWindowOptions", options);
 
   // Creates BrowserWindow.
   window_.reset(NativeWindow::Create(web_contents->managed_web_contents(),
@@ -51,16 +101,23 @@ Window::Window(v8::Isolate* isolate, const mate::Dictionary& options) {
   web_contents->SetOwnerWindow(window_.get());
   window_->InitFromOptions(options);
   window_->AddObserver(this);
+  AttachAsUserData(window_.get());
+
+#if defined(TOOLKIT_VIEWS)
+  // Sets the window icon.
+  mate::Handle<NativeImage> icon;
+  if (options.Get(options::kIcon, &icon))
+    SetIcon(icon);
+#endif
 }
 
 Window::~Window() {
-  if (window_)
-    Destroy();
-}
+  if (!window_->IsClosed())
+    window_->CloseContents(nullptr);
 
-void Window::OnPageTitleUpdated(bool* prevent_default,
-                                const std::string& title) {
-  *prevent_default = Emit("page-title-updated", title);
+  // Destroy the native window in next tick because the native code might be
+  // iterating all windows.
+  base::MessageLoop::current()->DeleteSoon(FROM_HERE, window_.release());
 }
 
 void Window::WillCloseWindow(bool* prevent_default) {
@@ -68,16 +125,19 @@ void Window::WillCloseWindow(bool* prevent_default) {
 }
 
 void Window::OnWindowClosed() {
-  if (api_web_contents_) {
-    api_web_contents_->DestroyWebContents();
-    api_web_contents_ = nullptr;
-    web_contents_.Reset();
-  }
+  api_web_contents_->DestroyWebContents();
 
   RemoveFromWeakMap();
   window_->RemoveObserver(this);
 
+  // We can not call Destroy here because we need to call Emit first, but we
+  // also do not want any method to be used, so just mark as destroyed here.
+  MarkDestroyed();
+
   Emit("closed");
+
+  // Destroy the native class when window is closed.
+  base::MessageLoop::current()->PostTask(FROM_HERE, GetDestroyClosure());
 }
 
 void Window::OnWindowBlur() {
@@ -86,6 +146,18 @@ void Window::OnWindowBlur() {
 
 void Window::OnWindowFocus() {
   Emit("focus");
+}
+
+void Window::OnWindowShow() {
+  Emit("show");
+}
+
+void Window::OnWindowHide() {
+  Emit("hide");
+}
+
+void Window::OnReadyToShow() {
+  Emit("ready-to-show");
 }
 
 void Window::OnWindowMaximize() {
@@ -124,6 +196,18 @@ void Window::OnWindowLeaveFullScreen() {
   Emit("leave-full-screen");
 }
 
+void Window::OnWindowScrollTouchBegin() {
+  Emit("scroll-touch-begin");
+}
+
+void Window::OnWindowScrollTouchEnd() {
+  Emit("scroll-touch-end");
+}
+
+void Window::OnWindowSwipe(const std::string& direction) {
+  Emit("swipe", direction);
+}
+
 void Window::OnWindowEnterHtmlFullScreen() {
   Emit("enter-html-full-screen");
 }
@@ -140,61 +224,51 @@ void Window::OnRendererResponsive() {
   Emit("responsive");
 }
 
-void Window::OnDevToolsFocus() {
-  Emit("devtools-focused");
-}
-
-void Window::OnDevToolsOpened() {
-  Emit("devtools-opened");
-
-  v8::Locker locker(isolate());
-  v8::HandleScope handle_scope(isolate());
-  auto handle = WebContents::CreateFrom(
-      isolate(), api_web_contents_->GetDevToolsWebContents());
-  devtools_web_contents_.Reset(isolate(), handle.ToV8());
-}
-
-void Window::OnDevToolsClosed() {
-  Emit("devtools-closed");
-
-  v8::Locker locker(isolate());
-  v8::HandleScope handle_scope(isolate());
-  devtools_web_contents_.Reset();
-}
-
 void Window::OnExecuteWindowsCommand(const std::string& command_name) {
   Emit("app-command", command_name);
 }
 
+#if defined(OS_WIN)
+void Window::OnWindowMessage(UINT message, WPARAM w_param, LPARAM l_param) {
+  if (IsWindowMessageHooked(message)) {
+    messages_callback_map_[message].Run(
+        ToBuffer(isolate(), static_cast<void*>(&w_param), sizeof(WPARAM)),
+        ToBuffer(isolate(), static_cast<void*>(&l_param), sizeof(LPARAM)));
+  }
+}
+#endif
+
 // static
-mate::Wrappable* Window::New(v8::Isolate* isolate,
-                             const mate::Dictionary& options) {
+mate::WrappableBase* Window::New(v8::Isolate* isolate, mate::Arguments* args) {
   if (!Browser::Get()->is_ready()) {
-    node::ThrowError(isolate,
-                     "Cannot create BrowserWindow before app is ready");
+    isolate->ThrowException(v8::Exception::Error(mate::StringToV8(
+        isolate, "Cannot create BrowserWindow before app is ready")));
     return nullptr;
   }
+
+  if (args->Length() > 1) {
+    args->ThrowError();
+    return nullptr;
+  }
+
+  mate::Dictionary options;
+  if (!(args->Length() == 1 && args->GetNext(&options))) {
+    options = mate::Dictionary::CreateEmpty(isolate);
+  }
+
   return new Window(isolate, options);
-}
-
-bool Window::IsDestroyed() const {
-  return !window_ || window_->IsClosed();
-}
-
-void Window::Destroy() {
-  window_->CloseContents(nullptr);
 }
 
 void Window::Close() {
   window_->Close();
 }
 
-bool Window::IsClosed() {
-  return window_->IsClosed();
-}
-
 void Window::Focus() {
   window_->Focus(true);
+}
+
+void Window::Blur() {
+  window_->Focus(false);
 }
 
 bool Window::IsFocused() {
@@ -249,16 +323,20 @@ bool Window::IsFullscreen() {
   return window_->IsFullscreen();
 }
 
-void Window::SetBounds(const gfx::Rect& bounds) {
-  window_->SetBounds(bounds);
+void Window::SetBounds(const gfx::Rect& bounds, mate::Arguments* args) {
+  bool animate = false;
+  args->GetNext(&animate);
+  window_->SetBounds(bounds, animate);
 }
 
 gfx::Rect Window::GetBounds() {
   return window_->GetBounds();
 }
 
-void Window::SetSize(int width, int height) {
-  window_->SetSize(gfx::Size(width, height));
+void Window::SetSize(int width, int height, mate::Arguments* args) {
+  bool animate = false;
+  args->GetNext(&animate);
+  window_->SetSize(gfx::Size(width, height), animate);
 }
 
 std::vector<int> Window::GetSize() {
@@ -269,8 +347,10 @@ std::vector<int> Window::GetSize() {
   return result;
 }
 
-void Window::SetContentSize(int width, int height) {
-  window_->SetContentSize(gfx::Size(width, height));
+void Window::SetContentSize(int width, int height, mate::Arguments* args) {
+  bool animate = false;
+  args->GetNext(&animate);
+  window_->SetContentSize(gfx::Size(width, height), animate);
 }
 
 std::vector<int> Window::GetContentSize() {
@@ -305,12 +385,58 @@ std::vector<int> Window::GetMaximumSize() {
   return result;
 }
 
+void Window::SetSheetOffset(double offsetY, mate::Arguments* args) {
+  double offsetX = 0.0;
+  args->GetNext(&offsetX);
+  window_->SetSheetOffset(offsetX, offsetY);
+}
+
 void Window::SetResizable(bool resizable) {
   window_->SetResizable(resizable);
 }
 
 bool Window::IsResizable() {
   return window_->IsResizable();
+}
+
+void Window::SetMovable(bool movable) {
+  window_->SetMovable(movable);
+}
+
+bool Window::IsMovable() {
+  return window_->IsMovable();
+}
+
+void Window::SetMinimizable(bool minimizable) {
+  window_->SetMinimizable(minimizable);
+}
+
+bool Window::IsMinimizable() {
+  return window_->IsMinimizable();
+}
+
+void Window::SetMaximizable(bool maximizable) {
+  window_->SetMaximizable(maximizable);
+}
+
+bool Window::IsMaximizable() {
+  return window_->IsMaximizable();
+}
+
+void Window::SetFullScreenable(bool fullscreenable) {
+  window_->SetFullScreenable(fullscreenable);
+}
+
+bool Window::IsFullScreenable() {
+  return window_->IsFullScreenable();
+}
+
+void Window::SetClosable(bool closable) {
+  window_->SetClosable(closable);
+}
+
+bool Window::IsClosable() {
+  return window_->IsClosable();
 }
 
 void Window::SetAlwaysOnTop(bool top) {
@@ -325,8 +451,10 @@ void Window::Center() {
   window_->Center();
 }
 
-void Window::SetPosition(int x, int y) {
-  window_->SetPosition(gfx::Point(x, y));
+void Window::SetPosition(int x, int y, mate::Arguments* args) {
+  bool animate = false;
+  args->GetNext(&animate);
+  window_->SetPosition(gfx::Point(x, y), animate);
 }
 
 std::vector<int> Window::GetPosition() {
@@ -361,6 +489,18 @@ bool Window::IsKiosk() {
   return window_->IsKiosk();
 }
 
+void Window::SetBackgroundColor(const std::string& color_name) {
+  window_->SetBackgroundColor(color_name);
+}
+
+void Window::SetHasShadow(bool has_shadow) {
+  window_->SetHasShadow(has_shadow);
+}
+
+bool Window::HasShadow() {
+  return window_->HasShadow();
+}
+
 void Window::FocusOnWebView() {
   window_->FocusOnWebView();
 }
@@ -389,6 +529,14 @@ bool Window::IsDocumentEdited() {
   return window_->IsDocumentEdited();
 }
 
+void Window::SetIgnoreMouseEvents(bool ignore) {
+  return window_->SetIgnoreMouseEvents(ignore);
+}
+
+void Window::SetFocusable(bool focusable) {
+  return window_->SetFocusable(focusable);
+}
+
 void Window::CapturePage(mate::Arguments* args) {
   gfx::Rect rect;
   base::Callback<void(const gfx::Image&)> callback;
@@ -411,6 +559,21 @@ void Window::SetProgressBar(double progress) {
 void Window::SetOverlayIcon(const gfx::Image& overlay,
                             const std::string& description) {
   window_->SetOverlayIcon(overlay, description);
+}
+
+bool Window::SetThumbarButtons(mate::Arguments* args) {
+#if defined(OS_WIN)
+  std::vector<TaskbarHost::ThumbarButton> buttons;
+  if (!args->GetNext(&buttons)) {
+    args->ThrowError();
+    return false;
+  }
+  auto window = static_cast<NativeWindowViews*>(window_.get());
+  return window->taskbar_host().SetThumbarButtons(
+      window->GetAcceleratedWidget(), buttons);
+#else
+  return false;
+#endif
 }
 
 void Window::SetMenu(v8::Isolate* isolate, v8::Local<v8::Value> value) {
@@ -445,11 +608,53 @@ bool Window::IsMenuBarVisible() {
   return window_->IsMenuBarVisible();
 }
 
-#if defined(OS_MACOSX)
-void Window::ShowDefinitionForSelection() {
-  window_->ShowDefinitionForSelection();
+#if defined(OS_WIN)
+bool Window::HookWindowMessage(UINT message,
+                               const MessageCallback& callback) {
+  messages_callback_map_[message] = callback;
+  return true;
+}
+
+void Window::UnhookWindowMessage(UINT message) {
+  if (!ContainsKey(messages_callback_map_, message))
+    return;
+
+  messages_callback_map_.erase(message);
+}
+
+bool Window::IsWindowMessageHooked(UINT message) {
+  return ContainsKey(messages_callback_map_, message);
+}
+
+void Window::UnhookAllWindowMessages() {
+  messages_callback_map_.clear();
 }
 #endif
+
+#if defined(TOOLKIT_VIEWS)
+void Window::SetIcon(mate::Handle<NativeImage> icon) {
+#if defined(OS_WIN)
+  static_cast<NativeWindowViews*>(window_.get())->SetIcon(
+      icon->GetHICON(GetSystemMetrics(SM_CXSMICON)),
+      icon->GetHICON(GetSystemMetrics(SM_CXICON)));
+#elif defined(USE_X11)
+  static_cast<NativeWindowViews*>(window_.get())->SetIcon(
+      icon->image().AsImageSkia());
+#endif
+}
+#endif
+
+void Window::SetAspectRatio(double aspect_ratio, mate::Arguments* args) {
+  gfx::Size extra_size;
+  args->GetNext(&extra_size);
+  window_->SetAspectRatio(aspect_ratio, extra_size);
+}
+
+v8::Local<v8::Value> Window::GetNativeWindowHandle() {
+  gfx::AcceleratedWidget handle = window_->GetAcceleratedWidget();
+  return ToBuffer(
+      isolate(), static_cast<void*>(&handle), sizeof(gfx::AcceleratedWidget));
+}
 
 void Window::SetVisibleOnAllWorkspaces(bool visible) {
   return window_->SetVisibleOnAllWorkspaces(visible);
@@ -470,21 +675,14 @@ v8::Local<v8::Value> Window::WebContents(v8::Isolate* isolate) {
     return v8::Local<v8::Value>::New(isolate, web_contents_);
 }
 
-v8::Local<v8::Value> Window::DevToolsWebContents(v8::Isolate* isolate) {
-  if (devtools_web_contents_.IsEmpty())
-    return v8::Null(isolate);
-  else
-    return v8::Local<v8::Value>::New(isolate, devtools_web_contents_);
-}
-
 // static
 void Window::BuildPrototype(v8::Isolate* isolate,
                             v8::Local<v8::ObjectTemplate> prototype) {
   mate::ObjectTemplateBuilder(isolate, prototype)
-      .SetMethod("destroy", &Window::Destroy, true)
+      .MakeDestroyable()
       .SetMethod("close", &Window::Close)
-      .SetMethod("isClosed", &Window::IsClosed)
       .SetMethod("focus", &Window::Focus)
+      .SetMethod("blur", &Window::Blur)
       .SetMethod("isFocused", &Window::IsFocused)
       .SetMethod("show", &Window::Show)
       .SetMethod("showInactive", &Window::ShowInactive)
@@ -498,6 +696,8 @@ void Window::BuildPrototype(v8::Isolate* isolate,
       .SetMethod("isMinimized", &Window::IsMinimized)
       .SetMethod("setFullScreen", &Window::SetFullScreen)
       .SetMethod("isFullScreen", &Window::IsFullscreen)
+      .SetMethod("setAspectRatio", &Window::SetAspectRatio)
+      .SetMethod("getNativeWindowHandle", &Window::GetNativeWindowHandle)
       .SetMethod("getBounds", &Window::GetBounds)
       .SetMethod("setBounds", &Window::SetBounds)
       .SetMethod("getSize", &Window::GetSize)
@@ -508,8 +708,19 @@ void Window::BuildPrototype(v8::Isolate* isolate,
       .SetMethod("getMinimumSize", &Window::GetMinimumSize)
       .SetMethod("setMaximumSize", &Window::SetMaximumSize)
       .SetMethod("getMaximumSize", &Window::GetMaximumSize)
+      .SetMethod("setSheetOffset", &Window::SetSheetOffset)
       .SetMethod("setResizable", &Window::SetResizable)
       .SetMethod("isResizable", &Window::IsResizable)
+      .SetMethod("setMovable", &Window::SetMovable)
+      .SetMethod("isMovable", &Window::IsMovable)
+      .SetMethod("setMinimizable", &Window::SetMinimizable)
+      .SetMethod("isMinimizable", &Window::IsMinimizable)
+      .SetMethod("setMaximizable", &Window::SetMaximizable)
+      .SetMethod("isMaximizable", &Window::IsMaximizable)
+      .SetMethod("setFullScreenable", &Window::SetFullScreenable)
+      .SetMethod("isFullScreenable", &Window::IsFullScreenable)
+      .SetMethod("setClosable", &Window::SetClosable)
+      .SetMethod("isClosable", &Window::IsClosable)
       .SetMethod("setAlwaysOnTop", &Window::SetAlwaysOnTop)
       .SetMethod("isAlwaysOnTop", &Window::IsAlwaysOnTop)
       .SetMethod("center", &Window::Center)
@@ -521,16 +732,22 @@ void Window::BuildPrototype(v8::Isolate* isolate,
       .SetMethod("setSkipTaskbar", &Window::SetSkipTaskbar)
       .SetMethod("setKiosk", &Window::SetKiosk)
       .SetMethod("isKiosk", &Window::IsKiosk)
+      .SetMethod("setBackgroundColor", &Window::SetBackgroundColor)
+      .SetMethod("setHasShadow", &Window::SetHasShadow)
+      .SetMethod("hasShadow", &Window::HasShadow)
       .SetMethod("setRepresentedFilename", &Window::SetRepresentedFilename)
       .SetMethod("getRepresentedFilename", &Window::GetRepresentedFilename)
       .SetMethod("setDocumentEdited", &Window::SetDocumentEdited)
       .SetMethod("isDocumentEdited", &Window::IsDocumentEdited)
+      .SetMethod("setIgnoreMouseEvents", &Window::SetIgnoreMouseEvents)
+      .SetMethod("setFocusable", &Window::SetFocusable)
       .SetMethod("focusOnWebView", &Window::FocusOnWebView)
       .SetMethod("blurWebView", &Window::BlurWebView)
       .SetMethod("isWebViewFocused", &Window::IsWebViewFocused)
       .SetMethod("capturePage", &Window::CapturePage)
       .SetMethod("setProgressBar", &Window::SetProgressBar)
       .SetMethod("setOverlayIcon", &Window::SetOverlayIcon)
+      .SetMethod("setThumbarButtons", &Window::SetThumbarButtons)
       .SetMethod("setMenu", &Window::SetMenu)
       .SetMethod("setAutoHideMenuBar", &Window::SetAutoHideMenuBar)
       .SetMethod("isMenuBarAutoHide", &Window::IsMenuBarAutoHide)
@@ -540,13 +757,27 @@ void Window::BuildPrototype(v8::Isolate* isolate,
                  &Window::SetVisibleOnAllWorkspaces)
       .SetMethod("isVisibleOnAllWorkspaces",
                  &Window::IsVisibleOnAllWorkspaces)
-#if defined(OS_MACOSX)
-      .SetMethod("showDefinitionForSelection",
-                 &Window::ShowDefinitionForSelection)
+#if defined(OS_WIN)
+      .SetMethod("hookWindowMessage", &Window::HookWindowMessage)
+      .SetMethod("isWindowMessageHooked", &Window::IsWindowMessageHooked)
+      .SetMethod("unhookWindowMessage", &Window::UnhookWindowMessage)
+      .SetMethod("unhookAllWindowMessages", &Window::UnhookAllWindowMessages)
 #endif
-      .SetProperty("id", &Window::ID, true)
-      .SetProperty("webContents", &Window::WebContents, true)
-      .SetProperty("devToolsWebContents", &Window::DevToolsWebContents, true);
+#if defined(TOOLKIT_VIEWS)
+      .SetMethod("setIcon", &Window::SetIcon)
+#endif
+      .SetProperty("id", &Window::ID)
+      .SetProperty("webContents", &Window::WebContents);
+}
+
+// static
+v8::Local<v8::Value> Window::From(v8::Isolate* isolate,
+                                  NativeWindow* native_window) {
+  auto existing = TrackableObject::FromWrappedClass(isolate, native_window);
+  if (existing)
+    return existing->GetWrapper();
+  else
+    return v8::Null(isolate);
 }
 
 }  // namespace api

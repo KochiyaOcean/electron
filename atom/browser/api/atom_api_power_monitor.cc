@@ -5,18 +5,18 @@
 #include "atom/browser/api/atom_api_power_monitor.h"
 
 #include "atom/browser/browser.h"
+#include "atom/common/node_includes.h"
 #include "base/power_monitor/power_monitor.h"
 #include "base/power_monitor/power_monitor_device_source.h"
 #include "native_mate/dictionary.h"
-
-#include "atom/common/node_includes.h"
 
 namespace atom {
 
 namespace api {
 
-PowerMonitor::PowerMonitor() {
+PowerMonitor::PowerMonitor(v8::Isolate* isolate) {
   base::PowerMonitor::Get()->AddObserver(this);
+  Init(isolate);
 }
 
 PowerMonitor::~PowerMonitor() {
@@ -41,13 +41,19 @@ void PowerMonitor::OnResume() {
 // static
 v8::Local<v8::Value> PowerMonitor::Create(v8::Isolate* isolate) {
   if (!Browser::Get()->is_ready()) {
-    node::ThrowError(
+    isolate->ThrowException(v8::Exception::Error(mate::StringToV8(
         isolate,
-        "Cannot initialize \"power-monitor\" module before app is ready");
+        "Cannot initialize \"power-monitor\" module before app is ready")));
     return v8::Null(isolate);
   }
 
-  return CreateHandle(isolate, new PowerMonitor).ToV8();
+  return mate::CreateHandle(isolate, new PowerMonitor(isolate)).ToV8();
+}
+
+// static
+void PowerMonitor::BuildPrototype(
+    v8::Isolate* isolate, v8::Local<v8::ObjectTemplate> prototype) {
+  mate::ObjectTemplateBuilder(isolate, prototype);
 }
 
 }  // namespace api

@@ -8,18 +8,20 @@
 #include <string>
 #include <vector>
 
-#include "base/basictypes.h"
+#include "base/macros.h"
 #include "base/compiler_specific.h"
 #include "base/observer_list.h"
+#include "base/strings/string16.h"
 #include "atom/browser/browser_observer.h"
 #include "atom/browser/window_list_observer.h"
+#include "native_mate/arguments.h"
 
 #if defined(OS_WIN)
 #include "base/files/file_path.h"
-#include "base/strings/string16.h"
 #endif
 
 namespace base {
+class DictionaryValue;
 class FilePath;
 }
 
@@ -27,7 +29,13 @@ namespace ui {
 class MenuModel;
 }
 
+namespace gfx {
+class Image;
+}
+
 namespace atom {
+
+class LoginHandler;
 
 // This class is used for control application-wide operations.
 class Browser : public WindowListObserver {
@@ -39,6 +47,9 @@ class Browser : public WindowListObserver {
 
   // Try to close all windows and quit the application.
   void Quit();
+
+  // Exit the application immediately and set exit code.
+  void Exit(int code);
 
   // Cleanup everything and shutdown the application gracefully.
   void Shutdown();
@@ -64,7 +75,37 @@ class Browser : public WindowListObserver {
   // Clear the recent documents list.
   void ClearRecentDocuments();
 
+  // Set the application user model ID.
+  void SetAppUserModelID(const base::string16& name);
+
+  // Remove the default protocol handler registry key
+  bool RemoveAsDefaultProtocolClient(const std::string& protocol);
+
+  // Set as default handler for a protocol.
+  bool SetAsDefaultProtocolClient(const std::string& protocol);
+
+  // Query the current state of default handler for a protocol.
+  bool IsDefaultProtocolClient(const std::string& protocol);
+
 #if defined(OS_MACOSX)
+  // Hide the application.
+  void Hide();
+
+  // Show the application.
+  void Show();
+
+  // Creates an activity and sets it as the one currently in use.
+  void SetUserActivity(const std::string& type,
+                       const base::DictionaryValue& user_info,
+                       mate::Arguments* args);
+
+  // Returns the type name of the current user activity.
+  std::string GetCurrentActivityType();
+
+  // Resumes an activity via hand-off.
+  bool ContinueUserActivity(const std::string& type,
+                            const base::DictionaryValue& user_info);
+
   // Bounce the dock icon.
   enum BounceType {
     BOUNCE_CRITICAL = 0,
@@ -72,6 +113,9 @@ class Browser : public WindowListObserver {
   };
   int DockBounce(BounceType type);
   void DockCancelBounce(int request_id);
+
+  // Bounce the Downloads stack.
+  void DockDownloadFinished(const std::string& filePath);
 
   // Set/Get dock's badge text.
   void DockSetBadgeText(const std::string& label);
@@ -83,6 +127,9 @@ class Browser : public WindowListObserver {
 
   // Set docks' menu.
   void DockSetMenu(ui::MenuModel* model);
+
+  // Set docks' icon.
+  void DockSetIcon(const gfx::Image& image);
 #endif  // defined(OS_MACOSX)
 
 #if defined(OS_WIN)
@@ -98,8 +145,10 @@ class Browser : public WindowListObserver {
   // Add a custom task to jump list.
   void SetUserTasks(const std::vector<UserTask>& tasks);
 
-  // Set the application user model ID, called when "SetName" is called.
-  void SetAppUserModelID(const std::string& name);
+  // Returns the application user model ID, if there isn't one, then create
+  // one from app's name.
+  // The returned string managed by Browser, and should not be modified.
+  PCWSTR GetAppUserModelID();
 #endif
 
   // Tell the application to open a file.
@@ -108,18 +157,17 @@ class Browser : public WindowListObserver {
   // Tell the application to open a url.
   void OpenURL(const std::string& url);
 
-  // Tell the application that application is activated with no open windows.
-  void ActivateWithNoOpenWindows();
+  // Tell the application that application is activated with visible/invisible
+  // windows.
+  void Activate(bool has_visible_windows);
 
   // Tell the application the loading has been done.
   void WillFinishLaunching();
   void DidFinishLaunching();
 
-  // Called when client certificate is required.
-  void ClientCertificateSelector(
-      content::WebContents* web_contents,
-      net::SSLCertRequestInfo* cert_request_info,
-      scoped_ptr<content::ClientCertificateDelegate> delegate);
+  // Request basic auth login.
+  void RequestLogin(LoginHandler* login_handler,
+                    std::unique_ptr<base::DictionaryValue> request_details);
 
   void AddObserver(BrowserObserver* obs) {
     observers_.AddObserver(obs);
@@ -129,6 +177,7 @@ class Browser : public WindowListObserver {
     observers_.RemoveObserver(obs);
   }
 
+  bool is_shutting_down() const { return is_shutdown_; }
   bool is_quiting() const { return is_quiting_; }
   bool is_ready() const { return is_ready_; }
 
@@ -153,10 +202,16 @@ class Browser : public WindowListObserver {
   void OnWindowAllClosed() override;
 
   // Observers of the browser.
-  ObserverList<BrowserObserver> observers_;
+  base::ObserverList<BrowserObserver> observers_;
+
+  // Whether `app.exit()` has been called
+  bool is_exiting_;
 
   // Whether "ready" event has been emitted.
   bool is_ready_;
+
+  // The browser is being shutdown.
+  bool is_shutdown_;
 
   std::string version_override_;
   std::string name_override_;

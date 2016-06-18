@@ -7,34 +7,32 @@
 
 #include <string>
 
-#include "net/url_request/url_request_context_getter.h"
+#include "atom/browser/net/js_asker.h"
+#include "browser/url_request_context_getter.h"
 #include "net/url_request/url_fetcher_delegate.h"
-#include "net/url_request/url_request_job.h"
 
 namespace atom {
 
-class AtomBrowserContext;
-
-class URLRequestFetchJob : public net::URLRequestJob,
-                           public net::URLFetcherDelegate {
+class URLRequestFetchJob : public JsAsker<net::URLRequestJob>,
+                           public net::URLFetcherDelegate,
+                           public brightray::URLRequestContextGetter::Delegate {
  public:
-  URLRequestFetchJob(net::URLRequestContextGetter* request_context_getter,
-                     net::URLRequest* request,
-                     net::NetworkDelegate* network_delegate,
-                     const GURL& url,
-                     const std::string& method,
-                     const std::string& referrer);
+  URLRequestFetchJob(net::URLRequest*, net::NetworkDelegate*);
 
-  net::URLRequestContextGetter* GetRequestContext();
+  // Called by response writer.
   void HeadersCompleted();
-  int DataAvailable(net::IOBuffer* buffer, int num_bytes);
+  int DataAvailable(net::IOBuffer* buffer,
+                    int num_bytes,
+                    const net::CompletionCallback& callback);
+
+ protected:
+  // JsAsker:
+  void BeforeStartInUI(v8::Isolate*, v8::Local<v8::Value>) override;
+  void StartAsync(std::unique_ptr<base::Value> options) override;
 
   // net::URLRequestJob:
-  void Start() override;
   void Kill() override;
-  bool ReadRawData(net::IOBuffer* buf,
-                   int buf_size,
-                   int* bytes_read) override;
+  int ReadRawData(net::IOBuffer* buf, int buf_size) override;
   bool GetMimeType(std::string* mime_type) const override;
   void GetResponseInfo(net::HttpResponseInfo* info) override;
   int GetResponseCode() const override;
@@ -43,11 +41,23 @@ class URLRequestFetchJob : public net::URLRequestJob,
   void OnURLFetchComplete(const net::URLFetcher* source) override;
 
  private:
+  int BufferCopy(net::IOBuffer* source, int num_bytes,
+                 net::IOBuffer* target, int target_size);
+  void ClearPendingBuffer();
+  void ClearWriteBuffer();
+
   scoped_refptr<net::URLRequestContextGetter> url_request_context_getter_;
-  scoped_ptr<net::URLFetcher> fetcher_;
+  std::unique_ptr<net::URLFetcher> fetcher_;
+  std::unique_ptr<net::HttpResponseInfo> response_info_;
+
+  // Saved arguments passed to ReadRawData.
   scoped_refptr<net::IOBuffer> pending_buffer_;
   int pending_buffer_size_;
-  scoped_ptr<net::HttpResponseInfo> response_info_;
+
+  // Saved arguments passed to DataAvailable.
+  scoped_refptr<net::IOBuffer> write_buffer_;
+  int write_num_bytes_;
+  net::CompletionCallback write_callback_;
 
   DISALLOW_COPY_AND_ASSIGN(URLRequestFetchJob);
 };

@@ -5,8 +5,11 @@
 #include "atom/browser/web_view_guest_delegate.h"
 
 #include "atom/browser/api/atom_api_web_contents.h"
+#include "atom/common/native_mate_converters/gurl_converter.h"
 #include "content/public/browser/guest_host.h"
+#include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_view_host.h"
+#include "content/public/browser/render_widget_host.h"
 #include "content/public/browser/render_widget_host_view.h"
 
 namespace atom {
@@ -19,8 +22,7 @@ const int kDefaultHeight = 300;
 }  // namespace
 
 WebViewGuestDelegate::WebViewGuestDelegate()
-    : guest_opaque_(true),
-      guest_host_(nullptr),
+    : guest_host_(nullptr),
       auto_size_enabled_(false),
       is_full_page_plugin_(false),
       api_web_contents_(nullptr) {
@@ -93,39 +95,10 @@ void WebViewGuestDelegate::SetSize(const SetSizeParams& params) {
   auto_size_enabled_ = enable_auto_size;
 }
 
-void WebViewGuestDelegate::SetAllowTransparency(bool allow) {
-  if (guest_opaque_ != allow)
-    return;
-
-  auto render_view_host = web_contents()->GetRenderViewHost();
-  guest_opaque_ = !allow;
-  if (!render_view_host->GetView())
-    return;
-
-  if (guest_opaque_) {
-    render_view_host->GetView()->SetBackgroundColorToDefault();
-  } else {
-    render_view_host->GetView()->SetBackgroundColor(SK_ColorTRANSPARENT);
-  }
-}
-
-void WebViewGuestDelegate::HandleKeyboardEvent(
-    content::WebContents* source,
-    const content::NativeWebKeyboardEvent& event) {
-  if (embedder_web_contents_)
-    embedder_web_contents_->GetDelegate()->HandleKeyboardEvent(source, event);
-}
-
-void WebViewGuestDelegate::RenderViewReady() {
-  // We don't want to accidentally set the opacity of an interstitial page.
-  // WebContents::GetRenderWidgetHostView will return the RWHV of an
-  // interstitial page if one is showing at this time. We only want opacity
-  // to apply to web pages.
-  auto render_view_host_view = web_contents()->GetRenderViewHost()->GetView();
-  if (guest_opaque_)
-    render_view_host_view->SetBackgroundColorToDefault();
-  else
-    render_view_host_view->SetBackgroundColor(SK_ColorTRANSPARENT);
+void WebViewGuestDelegate::DidCommitProvisionalLoadForFrame(
+    content::RenderFrameHost* render_frame_host,
+    const GURL& url, ui::PageTransition transition_type) {
+  api_web_contents_->Emit("load-commit", url, !render_frame_host->GetParent());
 }
 
 void WebViewGuestDelegate::DidAttach(int guest_proxy_routing_id) {
@@ -150,9 +123,11 @@ void WebViewGuestDelegate::SetGuestHost(content::GuestHost* guest_host) {
 void WebViewGuestDelegate::WillAttach(
     content::WebContents* embedder_web_contents,
     int element_instance_id,
-    bool is_full_page_plugin) {
+    bool is_full_page_plugin,
+    const base::Closure& completion_callback) {
   embedder_web_contents_ = embedder_web_contents;
   is_full_page_plugin_ = is_full_page_plugin;
+  completion_callback.Run();
 }
 
 void WebViewGuestDelegate::GuestSizeChangedDueToAutoSize(
